@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.pyc
+phishing_proxy.log
+.DS_Store
