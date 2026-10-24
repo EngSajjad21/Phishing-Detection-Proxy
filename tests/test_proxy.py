@@ -1,40 +1,36 @@
 import requests
-import time
-import sys
 
 PROXY_URL = "http://127.0.0.1:8080"
 TEST_URLS = {
-    "Safe URL (Google)": "http://www.google.com",
-    "Malicious URL (GS Test)": "http://testsafebrowsing.appspot.com/s/phishing.html",
-    "Malicious URL (Malware)": "http://testsafebrowsing.appspot.com/s/malware.html"
+    "Safe URL (Google)": ("http://www.google.com", 200),
+    "Malicious URL (GS Test)": (
+        "http://testsafebrowsing.appspot.com/s/phishing.html",
+        403,
+    ),
+    "Malicious URL (Malware)": (
+        "http://testsafebrowsing.appspot.com/s/malware.html",
+        403,
+    ),
 }
 
-def test_proxy():
-    print("🧪 Starting Proxy Tests...")
-    print("Make sure the proxy is running on localhost:8080\n")
-    
-    proxies = {
-        "http": PROXY_URL,
-        "https": PROXY_URL,
-    }
 
-    for name, url in TEST_URLS.items():
-        print(f"Testing {name}: {url}")
+def test_proxy():
+    """Run end-to-end checks against a locally running proxy."""
+    proxies = {"http": PROXY_URL, "https": PROXY_URL}
+    for name, (url, expected_status) in TEST_URLS.items():
         try:
-            # We use allow_redirects=False to see the proxy's direct response
-            response = requests.get(url, proxies=proxies, timeout=10, allow_redirects=False)
-            
-            if response.status_code == 403:
-                print(f"🛑 [BLOCKED] Status: {response.status_code} - Correctly blocked.")
-            elif response.status_code == 200:
-                print(f"✅ [ALLOWED] Status: {response.status_code} - Correctly allowed.")
-            else:
-                print(f"ℹ️ [INFO] Status: {response.status_code}")
-                
-        except Exception as e:
-            print(f"❌ [ERROR] Could not connect to proxy: {e}")
-            break
-        print("-" * 30)
+            response = requests.get(
+                url, proxies=proxies, timeout=10, allow_redirects=False
+            )
+        except requests.RequestException as exc:
+            raise AssertionError(
+                "Start the proxy with `python start.py` before running this test"
+            ) from exc
+        assert response.status_code == expected_status, (
+            f"{name}: expected {expected_status}, got {response.status_code}"
+        )
+
 
 if __name__ == "__main__":
     test_proxy()
+    print("Proxy tests passed.")

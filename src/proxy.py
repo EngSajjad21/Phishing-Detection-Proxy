@@ -1,28 +1,36 @@
+import html
 import http.server
-import socketserver
-import requests
 import logging
+import select
+import socket
+import socketserver
 from datetime import datetime
+from urllib.parse import urlsplit
+
+import requests
 from colorama import Fore, Style, init
+
 from detector import ThreatDetector
 
-# Initialize colorama
 init(autoreset=True)
 
-# Configuration
 PORT = 8080
 LOG_FILE = "phishing_proxy.log"
+BUFFER_SIZE = 64 * 1024
 
-# Setup logging
 logging.basicConfig(
     filename=LOG_FILE,
     level=logging.INFO,
-    format='[%(asctime)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="[%(asctime)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
+
 
 class ProxyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     detector = ThreatDetector()
+
+    def log_message(self, format_string, *args):
+        logging.info("%s - %s", self.address_string(), format_string % args)
 
     def do_GET(self):
         self._handle_request()
@@ -30,11 +38,48 @@ class ProxyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self._handle_request()
 
+    def do_HEAD(self):
+        self._handle_request()
+
+    def do_CONNECT(self):
+        """Create a raw tunnel for HTTPS; encrypted contents cannot be inspected."""
+        try:
+            host, port_text = self.path.rsplit(":", 1)
+            port = int(port_text)
+            if not host or not 1 <= port <= 65535:
+                raise ValueError
+            upstream = socket.create_connection((host, port), timeout=10)
+        except (ValueError, OSError) as exc:
+            logging.warning("CONNECT_FAILED: %s (%s)", self.path, exc)
+            self.send_error(502, "Unable to establish HTTPS tunnel")
+            return
+
+        self.send_response(200, "Connection Established")
+        self.end_headers()
+        logging.info("TUNNEL: %s", self.path)
+        try:
+            self._relay(self.connection, upstream)
+        finally:
+            upstream.close()
+
+    @staticmethod
+    def _relay(client, upstream):
+        sockets = [client, upstream]
+        while True:
+            readable, _, exceptional = select.select(sockets, [], sockets, 30)
+            if exceptional or not readable:
+                return
+            for source in readable:
+                data = source.recv(BUFFER_SIZE)
+                if not data:
+                    return
+                destination = upstream if source is client else client
+                destination.sendall(data)
+
     def _handle_request(self):
         url = self.path
-        if not url.startswith("http"):
-            # Handle cases where path doesn't include scheme (common in proxy requests)
-            host = self.headers.get('Host')
+        if not url.startswith(("http://", "https://")):
+            host = self.headers.get("Host")
             if host:
                 url = f"http://{host}{url}"
             else:
@@ -42,129 +87,84 @@ class ProxyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
 
         print(f"{Fore.CYAN}[*] Processing request: {url}")
-        
         is_malicious, reason, details = self.detector.is_malicious(url)
-
         if is_malicious:
             self._block_request(url, reason, details)
         else:
-            self._forward_request()
+            self._forward_request(url)
 
-    def _forward_request(self):
-        log_msg = f"ALLOWED: {self.path}"
+    def _forward_request(self, url):
+        log_msg = f"ALLOWED: {url}"
         logging.info(log_msg)
         print(f"{Fore.GREEN}[+] {log_msg}")
-        
-        # Simple forwarding
         try:
-            headers = {key: value for key, value in self.headers.items()}
-            # Remove proxy-specific headers
-            headers.pop('Proxy-Connection', None)
-            
-            method = self.command
+            headers = dict(self.headers.items())
+            headers.pop("Proxy-Connection", None)
             data = None
-            if method == 'POST':
-                content_length = int(self.headers.get('Content-Length', 0))
+            if self.command in {"POST", "PUT", "PATCH"}:
+                content_length = int(self.headers.get("Content-Length", 0))
                 data = self.rfile.read(content_length)
 
-            resp = requests.request(
-                method, 
-                self.path, 
-                headers=headers, 
-                data=data, 
-                stream=True, 
+            response = requests.request(
+                self.command,
+                url,
+                headers=headers,
+                data=data,
+                stream=True,
                 allow_redirects=False,
-                timeout=10
+                timeout=10,
             )
-
-            self.send_response(resp.status_code)
-            for key, value in resp.headers.items():
-                if key.lower() not in ['content-encoding', 'transfer-encoding', 'content-length', 'connection']:
-                     self.send_header(key, value)
-            
+            self.send_response(response.status_code)
+            for key, value in response.headers.items():
+                if key.lower() not in {
+                    "content-encoding",
+                    "transfer-encoding",
+                    "content-length",
+                    "connection",
+                }:
+                    self.send_header(key, value)
+            self.send_header("Content-Length", str(len(response.content)))
             self.end_headers()
-            self.wfile.write(resp.content)
-
-        except Exception as e:
-            print(f"{Fore.RED}[!] Error forwarding request: {e}")
-            self._send_error_page("Proxy Error", str(e))
+            if self.command != "HEAD":
+                self.wfile.write(response.content)
+        except Exception as exc:
+            print(f"{Fore.RED}[!] Error forwarding request: {exc}")
+            self._send_error_page("Proxy Error", str(exc))
 
     def _block_request(self, url, reason, details):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_msg = f"BLOCKED: {url} ({reason})"
         logging.info(log_msg)
         print(f"{Fore.RED}[!] {log_msg}")
-
         self.send_response(403)
-        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
-
-        block_page = f"""
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Access Blocked - Security Warning</title>
-            <style>
-                body {{
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                    background-color: #1a1a1a;
-                    color: #fff;
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                    height: 100vh;
-                    margin: 0;
-                }}
-                .container {{
-                    background-color: #2d2d2d;
-                    padding: 40px;
-                    border-radius: 12px;
-                    box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-                    text-align: center;
-                    max-width: 600px;
-                    border-top: 5px solid #ff4d4d;
-                }}
-                h1 {{ color: #ff4d4d; margin-top: 0; }}
-                .url {{ font-weight: bold; color: #ffa333; word-break: break-all; }}
-                .details {{ margin: 20px 0; font-size: 1.1em; color: #ddd; }}
-                .footer {{ margin-top: 30px; font-size: 0.8em; color: #888; }}
-                .icon {{ font-size: 50px; margin-bottom: 20px; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="icon">⚠️</div>
-                <h1>Warning: Malicious URL Detected!</h1>
-                <p class="details">The requested URL has been identified as a security threat.</p>
-                <p><strong>URL:</strong> <span class="url">{url}</span></p>
-                <p><strong>Reason:</strong> {reason}</p>
-                <p><strong>Time:</strong> {timestamp}</p>
-                <div class="footer">
-                    This request was intercepted and blocked by the Phishing Detection Proxy to protect your system.
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-        self.wfile.write(block_page.encode('utf-8'))
+        safe_url = html.escape(url)
+        safe_reason = html.escape(reason)
+        safe_details = html.escape(details)
+        block_page = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<title>Access Blocked - Security Warning</title></head><body>
+<h1>Warning: Malicious URL Detected!</h1>
+<p>The requested URL has been identified as a security threat.</p>
+<p><strong>URL:</strong> {safe_url}</p><p><strong>Reason:</strong> {safe_reason}</p>
+<p><strong>Details:</strong> {safe_details}</p><p><strong>Time:</strong> {timestamp}</p>
+</body></html>"""
+        self.wfile.write(block_page.encode("utf-8"))
 
     def _send_error_page(self, title, message):
         self.send_response(500)
-        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
-        error_html = f"<html><body><h1>{title}</h1><p>{message}</p></body></html>"
-        self.wfile.write(error_html.encode('utf-8'))
+        self.wfile.write(
+            f"<html><body><h1>{html.escape(title)}</h1>"
+            f"<p>{html.escape(message)}</p></body></html>".encode("utf-8")
+        )
+
 
 if __name__ == "__main__":
     with socketserver.ThreadingTCPServer(("", PORT), ProxyHTTPRequestHandler) as httpd:
-        print(f"{Fore.CYAN}===============================================")
-        print(f"{Fore.CYAN}   Phishing Detection Proxy is Running")
-        print(f"{Fore.CYAN}   Listening on port: {PORT}")
-        print(f"{Fore.CYAN}===============================================")
+        print(f"{Fore.CYAN}Phishing Detection Proxy listening on port {PORT}")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
             print(f"\n{Fore.YELLOW}[*] Shutting down proxy server...")
-            httpd.server_close()
